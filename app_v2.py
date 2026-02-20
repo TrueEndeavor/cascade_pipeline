@@ -12,6 +12,14 @@ import html
 import tempfile
 from dotenv import load_dotenv; load_dotenv()
 
+# Bridge Streamlit Cloud secrets → env vars (works both locally and deployed)
+try:
+    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"):
+        if key in st.secrets and key not in os.environ:
+            os.environ[key] = st.secrets[key]
+except FileNotFoundError:
+    pass  # no secrets file — rely on .env or sidebar input
+
 from pipeline.runner import build_evidence_pipeline
 from pipeline.state import PipelineState
 
