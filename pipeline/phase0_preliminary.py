@@ -73,10 +73,7 @@ def phase0_preliminary_extract(state: PipelineState) -> dict:
             artifact = '{"document_metadata": {}, "disclaimers": [], "performance_data": [], "rankings_awards": [], "definitions": [], "footnotes": [], "data_sources": [], "qualifications": [], "audience_indicators": {}, "temporal_context": {}, "visual_elements": []}'
     except Exception as e:
         print(f"[PHASE 0] Error: {e}")
-        return {
-            "preliminary_extraction": '{"document_metadata": {}, "disclaimers": [], "performance_data": [], "rankings_awards": [], "definitions": [], "footnotes": [], "data_sources": [], "qualifications": [], "audience_indicators": {}, "temporal_context": {}, "visual_elements": []}',
-            "token_usage": {},
-        }
+        raise RuntimeError(f"Phase 0 (Preliminary Extraction) failed: {e}") from e
 
     token_usage = {}
     if hasattr(response, "usage") and response.usage is not None:

@@ -94,10 +94,7 @@ def phase1_extract_evidence(state: PipelineState) -> dict:
             artifact = '{"registry": {"meta": {}, "claims": [], "contradictions": [], "coverage_gaps": []}}'
     except Exception as e:
         print(f"[PHASE 1] Error: {e}")
-        return {
-            "evidence_registry": '{"registry": {"meta": {}, "claims": [], "contradictions": [], "coverage_gaps": []}}',
-            "token_usage": state.get("token_usage", {}),
-        }
+        raise RuntimeError(f"Phase 1 (Evidence Registry) failed: {e}") from e
 
     # Merge token usage with Phase 0 data
     existing_usage = state.get("token_usage", {}) or {}
