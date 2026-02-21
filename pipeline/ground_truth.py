@@ -1,6 +1,7 @@
 """Ground truth matching — fetches GT from MongoDB and matches against claims/findings."""
 
 import os
+import re
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pymongo import MongoClient
@@ -18,11 +19,19 @@ def _get_db():
 
 
 def extract_tc_id(filename: str) -> str:
-    """Extract TC ID (e.g. 'TC04') from a filename like 'UPD_TC04_2 Updated.pdf'."""
-    parts = filename.upper().replace(".PDF", "").split("_")
-    for part in parts:
-        if part.startswith("TC") and len(part) <= 5:
-            return part
+    """Extract TC ID (e.g. 'TC04') from a filename.
+
+    Handles many naming styles:
+      UPD_TC04_2 Updated.pdf  →  TC04
+      TC 1.pdf                →  TC01
+      TC1.pdf                 →  TC01
+      tc04_doc.pdf            →  TC04
+      TC20_CM_Fed.pdf         →  TC20
+    """
+    match = re.search(r"TC\s*(\d+)", filename, re.IGNORECASE)
+    if match:
+        num = int(match.group(1))
+        return f"TC{num:02d}"  # Zero-pad to 2 digits (TC1 → TC01)
     return ""
 
 

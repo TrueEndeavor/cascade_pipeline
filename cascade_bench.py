@@ -13,6 +13,7 @@ Usage:
 
 import streamlit as st
 import os
+import re
 import json
 import tempfile
 from datetime import datetime, timezone
@@ -50,11 +51,14 @@ db = get_db()
 
 # --- Helpers ---
 def extract_tc_id(filename: str) -> str:
-    """Extract TC ID (e.g. 'TC04') from a filename like 'UPD_TC04_2 Updated.pdf'."""
-    parts = filename.upper().replace(".PDF", "").split("_")
-    for part in parts:
-        if part.startswith("TC") and len(part) <= 5:
-            return part
+    """Extract TC ID (e.g. 'TC04') from a filename.
+
+    Handles: UPD_TC04_2.pdf, TC 1.pdf, TC1.pdf, tc20_doc.pdf, etc.
+    """
+    match = re.search(r"TC\s*(\d+)", filename, re.IGNORECASE)
+    if match:
+        num = int(match.group(1))
+        return f"TC{num:02d}"
     return ""
 
 
