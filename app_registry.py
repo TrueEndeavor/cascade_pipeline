@@ -28,6 +28,7 @@ from pipeline.registry_checker import validate_registry
 from pipeline.state import PipelineState
 from pipeline.ground_truth import (
     extract_tc_id, fetch_ground_truth, match_claims_to_ground_truth,
+    save_to_ground_truth, THEME1_SUB_BUCKETS, THEME_CATEGORIES,
 )
 from langgraph.graph import StateGraph, START, END
 
@@ -393,6 +394,74 @@ if uploaded_file and st.button("Extract Evidence Registry", type="primary"):
                 <tbody>{rows}</tbody>
             </table>
             """, unsafe_allow_html=True)
+
+        # ─── Add to Ground Truth ─────────────────────────
+        non_gt_claims = [
+            (i, c) for i, c in enumerate(filtered_claims)
+            if c.get("claim_id", "") not in matched_claim_ids
+        ]
+        if non_gt_claims and tc_id:
+            st.markdown("---")
+            st.markdown("#### Add Claims to Ground Truth")
+            st.caption("Select claims to save as new ground truth entries in MongoDB.")
+
+            doc_name = ""
+            meta = registry.get("meta", {})
+            docs = meta.get("documents", [])
+            if docs:
+                doc_name = docs[0].get("name", uploaded_file.name)
+            else:
+                doc_name = uploaded_file.name
+
+            with st.form("add_to_gt_form"):
+                selected_claim_ids = []
+                for idx, c in non_gt_claims:
+                    label = f"**{c.get('claim_id', '')}** p.{c.get('page', '?')} — {c.get('exact_text', '')[:100]}"
+                    if st.checkbox(label, key=f"gt_cb_{idx}"):
+                        selected_claim_ids.append((idx, c))
+
+                gt_category = st.selectbox(
+                    "Theme / Category",
+                    THEME_CATEGORIES,
+                    index=0,
+                )
+
+                gt_sub_bucket = st.selectbox(
+                    "Sub-Bucket (applied to all selected)",
+                    ["Auto-detect from claim flags"] + THEME1_SUB_BUCKETS,
+                    index=0,
+                )
+
+                submitted = st.form_submit_button("Save to Ground Truth", type="primary")
+
+                if submitted and selected_claim_ids:
+                    saved = 0
+                    for idx, c in selected_claim_ids:
+                        finding = {
+                            "page_number": c.get("page", 0),
+                            "sentence": c.get("exact_text", ""),
+                            "observations": ", ".join(c.get("flags", [])),
+                            "rule_citation": "",
+                            "recommendations": "",
+                        }
+                        sb = gt_sub_bucket
+                        if sb == "Auto-detect from claim flags":
+                            sb = THEME1_SUB_BUCKETS[0]
+                        ok = save_to_ground_truth(
+                            tc_id=tc_id,
+                            document_name=doc_name,
+                            finding=finding,
+                            category=gt_category,
+                            sub_bucket=sb,
+                        )
+                        if ok:
+                            saved += 1
+                    if saved:
+                        st.success(f"Saved {saved} claim(s) to ground truth for {tc_id}")
+                    else:
+                        st.error("Failed to save to MongoDB. Check connection.")
+                elif submitted:
+                    st.warning("No claims selected.")
 
     # ─── Preliminary Scan ────────────────────────────────
 
