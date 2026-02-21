@@ -1,6 +1,7 @@
 """
 SEC Cascade v2 — Evidence Registry Pipeline UI
 Upload a PDF and see results: REGISTRY → CHECKER → DETECT → VALIDATE
+Green rows = matched against ground truth from MongoDB.
 
 Run: streamlit run app_v2.py
 """
@@ -12,16 +13,20 @@ import html
 import tempfile
 from dotenv import load_dotenv; load_dotenv()
 
-# Bridge Streamlit Cloud secrets → env vars (works both locally and deployed)
+# Bridge Streamlit Cloud secrets → env vars
 try:
-    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"):
+    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "MONGODB_URI"):
         if key in st.secrets and key not in os.environ:
             os.environ[key] = st.secrets[key]
 except FileNotFoundError:
-    pass  # no secrets file — rely on .env or sidebar input
+    pass
 
 from pipeline.runner import build_evidence_pipeline
 from pipeline.state import PipelineState
+from pipeline.ground_truth import (
+    extract_tc_id, fetch_ground_truth,
+    match_claims_to_ground_truth, match_findings_to_ground_truth,
+)
 
 st.set_page_config(page_title="SEC Cascade v2", layout="wide")
 
@@ -58,6 +63,13 @@ st.markdown("""
 .sec-table .cell-narrow { max-width: 100px; }
 .sec-table .cell-med { max-width: 200px; }
 
+/* Ground truth match — green row */
+.sec-table tr.gt-match { background: #c8e6c9 !important; }
+.sec-table tr.gt-match:hover { background: #a5d6a7 !important; }
+
+/* Missed ground truth — red row */
+.sec-table tr.gt-miss { background: #ffcdd2 !important; }
+
 /* Severity badges */
 .sev-critical { background: #d32f2f; color: #fff; padding: 2px 6px; border-radius: 3px; font-weight: 600; font-size: 0.78rem; }
 .sev-high { background: #e65100; color: #fff; padding: 2px 6px; border-radius: 3px; font-weight: 600; font-size: 0.78rem; }
@@ -76,34 +88,28 @@ st.markdown("""
 .q-absent { color: #616161; }
 
 .flag-tag { background: #ffcdd2; color: #b71c1c; padding: 1px 5px; border-radius: 3px; font-size: 0.75rem; margin-right: 3px; display: inline-block; margin-bottom: 2px; }
+.gt-badge { background: #2e7d32; color: #fff; padding: 1px 6px; border-radius: 3px; font-size: 0.72rem; font-weight: 600; }
 </style>
 """, unsafe_allow_html=True)
 
 
 def _esc(text):
-    """HTML-escape text for safe table rendering."""
     return html.escape(str(text)) if text else ""
-
 
 def _sev_badge(severity):
     s = str(severity).lower()
     css = {"critical": "sev-critical", "high": "sev-high", "medium": "sev-medium", "low": "sev-low"}.get(s, "sev-medium")
     return f'<span class="{css}">{_esc(severity)}</span>'
 
-
 def _disp_badge(disposition):
     css = "disp-flag" if disposition == "FLAG" else "disp-clear"
     return f'<span class="{css}">{_esc(disposition)}</span>'
-
 
 def _quality_dot(quality):
     q = str(quality).lower()
     css = {"adequate": "q-adequate", "partial": "q-partial", "weak": "q-weak",
            "contradictory": "q-contradictory", "absent": "q-absent"}.get(q, "q-absent")
-    symbols = {"adequate": "●", "partial": "●", "weak": "●",
-               "contradictory": "●", "absent": "●"}
-    return f'<span class="{css}">{symbols.get(q, "●")}</span> {_esc(quality)}'
-
+    return f'<span class="{css}">●</span> {_esc(quality)}'
 
 def _flag_tags(flags):
     if not flags:
@@ -141,7 +147,11 @@ with st.sidebar:
         "4. **Validate** — 6-check diagnostic + final findings"
     )
     st.divider()
-
+    st.markdown("**Ground Truth**")
+    st.markdown(
+        "Green rows = matched against ground truth from MongoDB. "
+        "Coverage % shows how many expected findings were captured."
+    )
 
 # --- File upload ---
 uploaded_file = st.file_uploader("Upload a PDF document", type=["pdf"])
@@ -151,6 +161,15 @@ if uploaded_file and st.button("Run Pipeline", type="primary"):
         tmp.write(uploaded_file.read())
         tmp_path = tmp.name
 
+    # ─── Fetch ground truth ──────────────────────────────
+    tc_id = extract_tc_id(uploaded_file.name)
+    ground_truth = fetch_ground_truth(tc_id) if tc_id else []
+    if ground_truth:
+        st.info(f"Found **{len(ground_truth)}** ground truth entries for **{tc_id}**")
+    elif tc_id:
+        st.warning(f"No ground truth found for **{tc_id}** in MongoDB")
+
+    # ─── Run pipeline ────────────────────────────────────
     app = build_evidence_pipeline()
     initial_state = PipelineState(
         pdf_path=tmp_path,
@@ -174,7 +193,7 @@ if uploaded_file and st.button("Run Pipeline", type="primary"):
 
     os.unlink(tmp_path)
 
-    # ─── Parse all outputs ───────────────────────────────────
+    # ─── Parse all outputs ───────────────────────────────
 
     try:
         registry_raw = json.loads(result.get("evidence_registry", "{}"))
@@ -198,7 +217,8 @@ if uploaded_file and st.button("Run Pipeline", type="primary"):
         findings_data = {"diagnostics": [], "sections": []}
 
     token_usage = result.get("token_usage") or {}
-    n_claims = len(registry.get("claims", []))
+    claims = registry.get("claims", [])
+    n_claims = len(claims)
     n_contradictions = len(registry.get("contradictions", []))
     candidates = candidates_data.get("candidates", [])
     n_candidates = len(candidates)
@@ -208,22 +228,43 @@ if uploaded_file and st.button("Run Pipeline", type="primary"):
     sections = findings_data.get("sections", [])
     n_findings = len(sections)
 
-    # ─── Summary metrics ─────────────────────────────────────
+    # ─── Ground truth matching ───────────────────────────
+
+    gt_claims_result = match_claims_to_ground_truth(claims, ground_truth) if ground_truth else None
+    gt_findings_result = match_findings_to_ground_truth(sections, ground_truth) if ground_truth else None
+
+    matched_claim_ids = gt_claims_result["matched_claim_ids"] if gt_claims_result else set()
+    matched_finding_indices = gt_findings_result["matched_finding_indices"] if gt_findings_result else set()
+
+    claims_coverage = gt_claims_result["coverage"] if gt_claims_result else None
+    findings_coverage = gt_findings_result["coverage"] if gt_findings_result else None
+
+    # ─── Summary metrics ─────────────────────────────────
 
     st.divider()
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Claims Extracted", n_claims)
-    col2.metric("Candidates", n_candidates)
-    col3.metric("Flagged", n_flagged)
-    col4.metric("Cleared", n_cleared)
-    col5.metric("Final Findings", n_findings)
+    if ground_truth:
+        mc1, mc2, mc3, mc4, mc5, mc6, mc7 = st.columns(7)
+        mc1.metric("Claims", n_claims)
+        mc2.metric("Candidates", n_candidates)
+        mc3.metric("Flagged", n_flagged)
+        mc4.metric("Cleared", n_cleared)
+        mc5.metric("Findings", n_findings)
+        mc6.metric("Registry GT", f"{claims_coverage:.0%}" if claims_coverage is not None else "—")
+        mc7.metric("Findings GT", f"{findings_coverage:.0%}" if findings_coverage is not None else "—")
+    else:
+        col1, col2, col3, col4, col5 = st.columns(5)
+        col1.metric("Claims Extracted", n_claims)
+        col2.metric("Candidates", n_candidates)
+        col3.metric("Flagged", n_flagged)
+        col4.metric("Cleared", n_cleared)
+        col5.metric("Final Findings", n_findings)
 
     total_in = sum(v for k, v in token_usage.items() if k.endswith("_input") and isinstance(v, (int, float)))
     total_out = sum(v for k, v in token_usage.items() if k.endswith("_output") and isinstance(v, (int, float)))
     if total_in:
         st.caption(f"Tokens: {total_in + total_out:,} total ({total_in:,} input / {total_out:,} output)")
 
-    # ─── Stage tabs ──────────────────────────────────────────
+    # ─── Stage tabs ──────────────────────────────────────
 
     tab_reg, tab_chk, tab_det, tab_val, tab_fin = st.tabs([
         f"1. Registry ({n_claims} claims)",
@@ -233,10 +274,18 @@ if uploaded_file and st.button("Run Pipeline", type="primary"):
         f"5. Findings ({n_findings})",
     ])
 
-    # ─── Tab 1: Evidence Registry ────────────────────────────
+    # ─── Tab 1: Evidence Registry ────────────────────────
 
     with tab_reg:
         st.subheader("Evidence Registry")
+        if ground_truth and gt_claims_result:
+            n_gt = len(ground_truth)
+            n_matched = len(gt_claims_result["matched_claim_ids"])
+            st.markdown(
+                f"**Ground Truth Coverage: {claims_coverage:.0%}** "
+                f"({n_matched}/{n_gt} expected items found) — "
+                f"Green rows = matched to ground truth"
+            )
 
         meta = registry.get("meta", {})
         docs = meta.get("documents", [])
@@ -251,7 +300,7 @@ if uploaded_file and st.button("Run Pipeline", type="primary"):
 
         # Claims table grouped by page
         claims_by_page = {}
-        for claim in registry.get("claims", []):
+        for claim in claims:
             page = str(claim.get("page", "?"))
             claims_by_page.setdefault(page, []).append(claim)
 
@@ -263,10 +312,13 @@ if uploaded_file and st.button("Run Pipeline", type="primary"):
                 quality = support.get("quality", "absent")
                 flags = claim.get("flags") or []
                 support_text = _esc(support.get("text", "")) if support.get("exists") else "<em>none</em>"
-                support_loc = _esc(support.get("location", "")) if support.get("exists") else ""
+                claim_id = claim.get("claim_id", "")
+                is_match = claim_id in matched_claim_ids
+                row_class = ' class="gt-match"' if is_match else ""
+                gt_label = ' <span class="gt-badge">GT</span>' if is_match else ""
 
-                rows += f"""<tr>
-                    <td class="cell-narrow"><strong>{_esc(claim.get('claim_id', ''))}</strong></td>
+                rows += f"""<tr{row_class}>
+                    <td class="cell-narrow"><strong>{_esc(claim_id)}</strong>{gt_label}</td>
                     <td class="cell-narrow">{_esc(claim.get('claim_type', ''))}</td>
                     <td class="cell-text">{_esc(claim.get('exact_text', ''))}</td>
                     <td class="cell-narrow">{_esc(claim.get('location', ''))}</td>
@@ -285,7 +337,7 @@ if uploaded_file and st.button("Run Pipeline", type="primary"):
             </table>
             """, unsafe_allow_html=True)
 
-        # Contradictions table
+        # Contradictions
         contradictions = registry.get("contradictions", [])
         if contradictions:
             st.markdown("#### Contradictions")
@@ -307,14 +359,29 @@ if uploaded_file and st.button("Run Pipeline", type="primary"):
             </table>
             """, unsafe_allow_html=True)
 
-    # ─── Tab 2: Checker ─────────────────────────────────────
+        # Missed ground truth
+        if gt_claims_result and gt_claims_result["missed_gt"]:
+            st.markdown("#### Missed Ground Truth")
+            st.error(f"{len(gt_claims_result['missed_gt'])} ground truth item(s) NOT found in the registry:")
+            rows = ""
+            for gt in gt_claims_result["missed_gt"]:
+                rows += f"""<tr class="gt-miss">
+                    <td class="cell-text">{_esc(gt.get('sentence', ''))}</td>
+                    <td class="cell-narrow">{_esc(gt.get('TC Id', ''))}</td>
+                </tr>"""
+            st.markdown(f"""
+            <table class="sec-table">
+                <thead><tr><th>Expected Sentence</th><th>TC ID</th></tr></thead>
+                <tbody>{rows}</tbody>
+            </table>
+            """, unsafe_allow_html=True)
+
+    # ─── Tab 2: Checker ─────────────────────────────────
 
     with tab_chk:
         st.subheader("Registry Checker Report")
-
         coverage = checker.get("coverage_score", 0)
         passed = checker.get("passed", False)
-
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Coverage Score", f"{coverage:.1%}")
         c2.metric("Status", "PASSED" if passed else "WARNINGS")
@@ -350,7 +417,7 @@ if uploaded_file and st.button("Run Pipeline", type="primary"):
             st.markdown("**Orphan numbers** (numbers in PDF not in registry):")
             st.code(", ".join(i["number"] for i in orphans))
 
-    # ─── Tab 3: Detect ──────────────────────────────────────
+    # ─── Tab 3: Detect ──────────────────────────────────
 
     with tab_det:
         st.subheader("Theme 1 — Candidate Violations")
@@ -361,11 +428,14 @@ if uploaded_file and st.button("Run Pipeline", type="primary"):
             for i, c in enumerate(candidates, 1):
                 severity = c.get("severity", "Medium")
                 flags = c.get("flags_from_registry") or []
-                rows += f"""<tr>
+                claim_id = c.get("claim_id", "")
+                is_match = claim_id in matched_claim_ids
+                row_class = ' class="gt-match"' if is_match else ""
+                rows += f"""<tr{row_class}>
                     <td class="cell-narrow" style="text-align:center">{i}</td>
                     <td class="cell-narrow">{_sev_badge(severity)}</td>
                     <td class="cell-narrow" style="text-align:center">p.{_esc(c.get('page', '?'))}</td>
-                    <td class="cell-narrow">{_esc(c.get('claim_id', ''))}</td>
+                    <td class="cell-narrow">{_esc(claim_id)}</td>
                     <td class="cell-narrow">SB{_esc(c.get('sub_bucket', '?'))}</td>
                     <td class="cell-med">{_esc(c.get('sub_bucket_name', ''))}</td>
                     <td class="cell-text">{_esc(c.get('exact_text', ''))}</td>
@@ -384,7 +454,7 @@ if uploaded_file and st.button("Run Pipeline", type="primary"):
             </table>
             """, unsafe_allow_html=True)
 
-    # ─── Tab 4: Validate ────────────────────────────────────
+    # ─── Tab 4: Validate ────────────────────────────────
 
     with tab_val:
         st.subheader("Diagnostic Review")
@@ -396,10 +466,13 @@ if uploaded_file and st.button("Run Pipeline", type="primary"):
             else:
                 rows = ""
                 for i, d in enumerate(flagged_diag, 1):
-                    rows += f"""<tr>
+                    claim_id = d.get("claim_id", "")
+                    is_match = claim_id in matched_claim_ids
+                    row_class = ' class="gt-match"' if is_match else ""
+                    rows += f"""<tr{row_class}>
                         <td class="cell-narrow" style="text-align:center">{i}</td>
                         <td class="cell-narrow">{_disp_badge('FLAG')}</td>
-                        <td class="cell-narrow">{_esc(d.get('claim_id', ''))}</td>
+                        <td class="cell-narrow">{_esc(claim_id)}</td>
                         <td class="cell-narrow" style="text-align:center">p.{_esc(d.get('page', '?'))}</td>
                         <td class="cell-med">{_esc(d.get('sub_bucket', ''))}</td>
                         <td class="cell-text">{_esc(d.get('exact_text', ''))}</td>
@@ -443,10 +516,19 @@ if uploaded_file and st.button("Run Pipeline", type="primary"):
                 </table>
                 """, unsafe_allow_html=True)
 
-    # ─── Tab 5: Final Findings ──────────────────────────────
+    # ─── Tab 5: Final Findings ──────────────────────────
 
     with tab_fin:
         st.subheader("Final Compliance Findings")
+        if ground_truth and gt_findings_result:
+            n_gt = len(ground_truth)
+            n_matched = len(gt_findings_result["matched_finding_indices"])
+            st.markdown(
+                f"**Ground Truth Coverage: {findings_coverage:.0%}** "
+                f"({n_matched}/{n_gt} expected findings matched) — "
+                f"Green rows = matched to ground truth"
+            )
+
         if not sections:
             st.success("No violations found.")
         else:
@@ -458,8 +540,11 @@ if uploaded_file and st.button("Run Pipeline", type="primary"):
                     if level.lower() in summary_text.lower():
                         severity_word = level
                         break
-                rows += f"""<tr>
-                    <td class="cell-narrow" style="text-align:center">{i}</td>
+                is_match = (i - 1) in matched_finding_indices
+                row_class = ' class="gt-match"' if is_match else ""
+                gt_label = ' <span class="gt-badge">GT</span>' if is_match else ""
+                rows += f"""<tr{row_class}>
+                    <td class="cell-narrow" style="text-align:center">{i}{gt_label}</td>
                     <td class="cell-narrow">{_sev_badge(severity_word) if severity_word else '—'}</td>
                     <td class="cell-narrow" style="text-align:center">p.{_esc(s.get('page_number', '?'))}</td>
                     <td class="cell-med">{_esc(s.get('sub_bucket', ''))}</td>
@@ -480,7 +565,24 @@ if uploaded_file and st.button("Run Pipeline", type="primary"):
             </table>
             """, unsafe_allow_html=True)
 
-    # ─── Raw JSON ────────────────────────────────────────────
+        # Missed ground truth in findings
+        if gt_findings_result and gt_findings_result["missed_gt"]:
+            st.markdown("#### Missed Ground Truth")
+            st.error(f"{len(gt_findings_result['missed_gt'])} expected finding(s) NOT in final output:")
+            rows = ""
+            for gt in gt_findings_result["missed_gt"]:
+                rows += f"""<tr class="gt-miss">
+                    <td class="cell-text">{_esc(gt.get('sentence', ''))}</td>
+                    <td class="cell-narrow">{_esc(gt.get('TC Id', ''))}</td>
+                </tr>"""
+            st.markdown(f"""
+            <table class="sec-table">
+                <thead><tr><th>Expected Sentence</th><th>TC ID</th></tr></thead>
+                <tbody>{rows}</tbody>
+            </table>
+            """, unsafe_allow_html=True)
+
+    # ─── Raw JSON ────────────────────────────────────────
 
     with st.expander("Raw JSON Output", expanded=False):
         r1, r2, r3, r4 = st.tabs([

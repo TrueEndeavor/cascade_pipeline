@@ -16,7 +16,7 @@ from dotenv import load_dotenv; load_dotenv()
 
 # Bridge Streamlit Cloud secrets → env vars
 try:
-    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"):
+    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "MONGODB_URI"):
         if key in st.secrets and key not in os.environ:
             os.environ[key] = st.secrets[key]
 except FileNotFoundError:
@@ -26,6 +26,9 @@ from pipeline.phase0_preliminary import phase0_preliminary_extract
 from pipeline.phase1_evidence import phase1_extract_evidence
 from pipeline.registry_checker import validate_registry
 from pipeline.state import PipelineState
+from pipeline.ground_truth import (
+    extract_tc_id, fetch_ground_truth, match_claims_to_ground_truth,
+)
 from langgraph.graph import StateGraph, START, END
 
 st.set_page_config(page_title="Evidence Registry Review", layout="wide")
@@ -71,6 +74,12 @@ st.markdown("""
 
 .flag-tag { background: #ffcdd2; color: #b71c1c; padding: 1px 5px; border-radius: 3px; font-size: 0.75rem; margin-right: 3px; display: inline-block; margin-bottom: 2px; }
 .cat-tag { background: #e3f2fd; color: #0d47a1; padding: 1px 5px; border-radius: 3px; font-size: 0.75rem; }
+
+/* Ground truth match — green row */
+.sec-table tr.gt-match { background: #c8e6c9 !important; }
+.sec-table tr.gt-match:hover { background: #a5d6a7 !important; }
+.sec-table tr.gt-miss { background: #ffcdd2 !important; }
+.gt-badge { background: #2e7d32; color: #fff; padding: 1px 6px; border-radius: 3px; font-size: 0.72rem; font-weight: 600; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -143,6 +152,14 @@ if uploaded_file and st.button("Extract Evidence Registry", type="primary"):
         tmp.write(uploaded_file.read())
         tmp_path = tmp.name
 
+    # Fetch ground truth
+    tc_id = extract_tc_id(uploaded_file.name)
+    ground_truth = fetch_ground_truth(tc_id) if tc_id else []
+    if ground_truth:
+        st.info(f"Found **{len(ground_truth)}** ground truth entries for **{tc_id}**")
+    elif tc_id:
+        st.warning(f"No ground truth found for **{tc_id}** in MongoDB")
+
     app = _build_registry_pipeline()
     initial_state = PipelineState(
         pdf_path=tmp_path,
@@ -202,15 +219,30 @@ if uploaded_file and st.button("Extract Evidence Registry", type="primary"):
         if isinstance(prelim.get(k), list)
     )
 
+    # ─── Ground truth matching ───────────────────────────
+
+    gt_result = match_claims_to_ground_truth(claims, ground_truth) if ground_truth else None
+    matched_claim_ids = gt_result["matched_claim_ids"] if gt_result else set()
+    gt_coverage = gt_result["coverage"] if gt_result else None
+
     # ─── Summary metrics ─────────────────────────────────
 
     st.divider()
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Preliminary Items", prelim_total)
-    c2.metric("Final Claims", n_claims)
-    c3.metric("With Flags", n_flagged_claims)
-    c4.metric("Contradictions", n_contradictions)
-    c5.metric("Coverage Gaps", n_gaps)
+    if ground_truth:
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("Preliminary Items", prelim_total)
+        c2.metric("Final Claims", n_claims)
+        c3.metric("With Flags", n_flagged_claims)
+        c4.metric("Contradictions", n_contradictions)
+        c5.metric("Coverage Gaps", n_gaps)
+        c6.metric("GT Coverage", f"{gt_coverage:.0%}" if gt_coverage is not None else "—")
+    else:
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Preliminary Items", prelim_total)
+        c2.metric("Final Claims", n_claims)
+        c3.metric("With Flags", n_flagged_claims)
+        c4.metric("Contradictions", n_contradictions)
+        c5.metric("Coverage Gaps", n_gaps)
 
     total_in = sum(v for k, v in token_usage.items() if k.endswith("_input") and isinstance(v, (int, float)))
     total_out = sum(v for k, v in token_usage.items() if k.endswith("_output") and isinstance(v, (int, float)))
@@ -230,6 +262,14 @@ if uploaded_file and st.button("Extract Evidence Registry", type="primary"):
 
     with tab_reg:
         st.subheader("Claims Registry")
+        if ground_truth and gt_result:
+            n_gt = len(ground_truth)
+            n_matched = len(gt_result["matched_claim_ids"])
+            st.markdown(
+                f"**Ground Truth Coverage: {gt_coverage:.0%}** "
+                f"({n_matched}/{n_gt} expected items found) — "
+                f"Green rows = matched to ground truth"
+            )
         st.markdown("Review each claim below. Verify: exact text matches the PDF, support is correctly linked, flags are appropriate.")
 
         meta = registry.get("meta", {})
@@ -273,9 +313,13 @@ if uploaded_file and st.button("Extract Evidence Registry", type="primary"):
                 support_text = _esc(support.get("text", "")) if support.get("exists") else "<em>none</em>"
                 support_loc = _esc(support.get("location", "")) if support.get("exists") else ""
                 support_type = _esc(support.get("type", "")) if support.get("exists") else ""
+                claim_id = claim.get("claim_id", "")
+                is_match = claim_id in matched_claim_ids
+                row_class = ' class="gt-match"' if is_match else ""
+                gt_label = ' <span class="gt-badge">GT</span>' if is_match else ""
 
-                rows += f"""<tr>
-                    <td class="cell-narrow"><strong>{_esc(claim.get('claim_id', ''))}</strong></td>
+                rows += f"""<tr{row_class}>
+                    <td class="cell-narrow"><strong>{_esc(claim_id)}</strong>{gt_label}</td>
                     <td class="cell-narrow"><span class="cat-tag">{_esc(claim.get('claim_type', ''))}</span></td>
                     <td class="cell-text">{_esc(claim.get('exact_text', ''))}</td>
                     <td class="cell-narrow">{_esc(claim.get('location', ''))}</td>
@@ -332,6 +376,23 @@ if uploaded_file and st.button("Extract Evidence Registry", type="primary"):
             st.markdown(f"""
             <table class="sec-table">
                 <thead><tr><th>Preliminary ID</th><th>Category</th><th>Reason</th></tr></thead>
+                <tbody>{rows}</tbody>
+            </table>
+            """, unsafe_allow_html=True)
+
+        # Missed ground truth
+        if gt_result and gt_result["missed_gt"]:
+            st.markdown("#### Missed Ground Truth")
+            st.error(f"{len(gt_result['missed_gt'])} ground truth item(s) NOT found in the registry:")
+            rows = ""
+            for gt in gt_result["missed_gt"]:
+                rows += f"""<tr class="gt-miss">
+                    <td class="cell-text">{_esc(gt.get('sentence', ''))}</td>
+                    <td class="cell-narrow">{_esc(gt.get('TC Id', ''))}</td>
+                </tr>"""
+            st.markdown(f"""
+            <table class="sec-table">
+                <thead><tr><th>Expected Sentence</th><th>TC ID</th></tr></thead>
                 <tbody>{rows}</tbody>
             </table>
             """, unsafe_allow_html=True)
