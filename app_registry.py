@@ -36,6 +36,10 @@ st.set_page_config(page_title="Evidence Registry Review", layout="wide")
 # ─── CSS ──────────────────────────────────────────────────
 st.markdown("""
 <style>
+/* Narrow sidebar, maximize content area */
+[data-testid="stSidebar"] { min-width: 200px !important; max-width: 240px !important; }
+[data-testid="stSidebar"] .block-container { padding: 1rem 0.75rem; }
+
 .sec-table {
     width: 100%;
     border-collapse: collapse;
@@ -116,7 +120,7 @@ def _build_registry_pipeline():
 
 # ─── Header ──────────────────────────────────────────────
 st.title("Evidence Registry Review")
-st.caption("Upload a PDF → Extract all claims → Validate coverage  |  Powered by Anthropic Claude")
+st.caption("EXTRACT → REGISTRY → CHECKER")
 
 # ─── Sidebar ─────────────────────────────────────────────
 with st.sidebar:
@@ -125,13 +129,6 @@ with st.sidebar:
         "Model",
         value=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
     )
-    api_key = st.text_input(
-        "Anthropic API Key",
-        value=os.getenv("ANTHROPIC_API_KEY", ""),
-        type="password",
-    )
-    if api_key:
-        os.environ["ANTHROPIC_API_KEY"] = api_key
     if model:
         os.environ["ANTHROPIC_MODEL"] = model
 

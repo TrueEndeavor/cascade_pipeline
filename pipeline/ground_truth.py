@@ -1,6 +1,7 @@
 """Ground truth matching — fetches GT from MongoDB and matches against claims/findings."""
 
 import os
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pymongo import MongoClient
 
@@ -136,3 +137,57 @@ def match_findings_to_ground_truth(
         "missed_gt": missed_gt,
         "coverage": coverage,
     }
+
+
+# Sub-bucket options for Theme 1
+THEME1_SUB_BUCKETS = [
+    "1. Unsubstantiated or inadequately supported statements of fact",
+    "2. Promissory or certain-outcome language implying guaranteed results",
+    "3. Implied guarantees or certainty created through framing, tone, or contextual emphasis",
+    "4. Overstated, absolute, or best-in-class type claims lacking appropriate qualification",
+    "5. Unbalanced presentation of benefits without corresponding risks, limitations, or conditions",
+    "6. Exaggerated or amplified claims that materially overstate capability, experience, or outcomes",
+    "7. Vague, ambiguous, or undefined claims that prevent reasonable investor understanding",
+    "8. Audience-inappropriate language or complexity that creates a misleading impression",
+    "9. Unfair, deceptive, or unclear communications that could reasonably result in consumer or investor harm",
+    "10. ESG, impact, sustainability, or qualitative claims lacking clear definitions, scope, or evidentiary support",
+]
+
+THEME_CATEGORIES = [
+    "Misleading, Exaggerated, or Unsubstantiated Claims",
+]
+
+
+def save_to_ground_truth(
+    tc_id: str,
+    document_name: str,
+    finding: dict,
+    category: str,
+    sub_bucket: str,
+) -> bool:
+    """Save a finding as a new ground truth entry in MongoDB.
+
+    Returns True on success, False on failure.
+    """
+    try:
+        db = _get_db()
+        entry = {
+            "TC Id": tc_id,
+            "Document": document_name,
+            "page_number": finding.get("page_number", 0),
+            "sentence": finding.get("sentence", ""),
+            "observations": finding.get("observations", ""),
+            "rule_citation": finding.get("rule_citation", ""),
+            "recommendations": finding.get("recommendations", ""),
+            "category": category,
+            "sub_bucket": sub_bucket,
+            "Compliant": "",
+            "is_active": True,
+            "uploaded_at": datetime.now(timezone.utc),
+            "source": "app_v2_review",
+        }
+        db["ground_truth"].insert_one(entry)
+        return True
+    except Exception as e:
+        print(f"[GT] Could not save ground truth: {e}")
+        return False

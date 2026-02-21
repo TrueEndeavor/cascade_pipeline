@@ -26,6 +26,7 @@ from pipeline.state import PipelineState
 from pipeline.ground_truth import (
     extract_tc_id, fetch_ground_truth,
     match_claims_to_ground_truth, match_findings_to_ground_truth,
+    save_to_ground_truth, THEME1_SUB_BUCKETS, THEME_CATEGORIES,
 )
 
 st.set_page_config(page_title="SEC Cascade v2", layout="wide")
@@ -33,6 +34,10 @@ st.set_page_config(page_title="SEC Cascade v2", layout="wide")
 # ─── Global table CSS ─────────────────────────────────────
 st.markdown("""
 <style>
+/* Narrow sidebar, maximize content area */
+[data-testid="stSidebar"] { min-width: 200px !important; max-width: 240px !important; }
+[data-testid="stSidebar"] .block-container { padding: 1rem 0.75rem; }
+
 .sec-table {
     width: 100%;
     border-collapse: collapse;
@@ -118,7 +123,7 @@ def _flag_tags(flags):
 
 
 st.title("SEC Compliance — Evidence Registry Pipeline")
-st.caption("REGISTRY → CHECKER → DETECT → VALIDATE  |  Powered by Anthropic Claude")
+st.caption("EXTRACT → REGISTRY → CHECKER → DETECT → VALIDATE")
 
 # --- Sidebar ---
 with st.sidebar:
@@ -127,13 +132,6 @@ with st.sidebar:
         "Model",
         value=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
     )
-    api_key = st.text_input(
-        "Anthropic API Key",
-        value=os.getenv("ANTHROPIC_API_KEY", ""),
-        type="password",
-    )
-    if api_key:
-        os.environ["ANTHROPIC_API_KEY"] = api_key
     if model:
         os.environ["ANTHROPIC_MODEL"] = model
 
@@ -564,6 +562,69 @@ if uploaded_file and st.button("Run Pipeline", type="primary"):
                 <tbody>{rows}</tbody>
             </table>
             """, unsafe_allow_html=True)
+
+        # ─── Add to Ground Truth ─────────────────────────
+        # Only show for findings NOT already in GT
+        non_gt_findings = [
+            (i, s) for i, s in enumerate(sections)
+            if i not in matched_finding_indices
+        ]
+        if non_gt_findings and tc_id:
+            st.markdown("---")
+            st.markdown("#### Add Findings to Ground Truth")
+            st.caption("Select findings to add as new ground truth entries in MongoDB.")
+
+            doc_name = ""
+            meta = registry.get("meta", {})
+            docs = meta.get("documents", [])
+            if docs:
+                doc_name = docs[0].get("name", uploaded_file.name)
+            else:
+                doc_name = uploaded_file.name
+
+            with st.form("add_to_gt_form"):
+                selected_indices = []
+                for idx, s in non_gt_findings:
+                    label = f"**#{idx+1}** p.{s.get('page_number', '?')} — {s.get('sentence', '')[:100]}"
+                    if st.checkbox(label, key=f"gt_cb_{idx}"):
+                        selected_indices.append(idx)
+
+                gt_category = st.selectbox(
+                    "Theme / Category",
+                    THEME_CATEGORIES,
+                    index=0,
+                )
+
+                gt_sub_bucket = st.selectbox(
+                    "Sub-Bucket (applied to all selected)",
+                    ["Auto-detect from finding"] + THEME1_SUB_BUCKETS,
+                    index=0,
+                )
+
+                submitted = st.form_submit_button("Save to Ground Truth", type="primary")
+
+                if submitted and selected_indices:
+                    saved = 0
+                    for idx in selected_indices:
+                        finding = sections[idx]
+                        sb = gt_sub_bucket
+                        if sb == "Auto-detect from finding":
+                            sb = finding.get("sub_bucket", THEME1_SUB_BUCKETS[0])
+                        ok = save_to_ground_truth(
+                            tc_id=tc_id,
+                            document_name=doc_name,
+                            finding=finding,
+                            category=gt_category,
+                            sub_bucket=sb,
+                        )
+                        if ok:
+                            saved += 1
+                    if saved:
+                        st.success(f"Saved {saved} finding(s) to ground truth for {tc_id}")
+                    else:
+                        st.error("Failed to save to MongoDB. Check connection.")
+                elif submitted:
+                    st.warning("No findings selected.")
 
         # Missed ground truth in findings
         if gt_findings_result and gt_findings_result["missed_gt"]:
